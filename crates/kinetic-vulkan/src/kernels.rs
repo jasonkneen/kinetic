@@ -6,10 +6,18 @@ use crate::error::{Error, Result};
 use crate::memory::DeviceBuffer;
 use crate::pipeline::Kernel;
 
-/// SPIR-V written by build.rs.
+/// A kernel as build.rs wrote it for the driver: SPIR-V for Vulkan, Metal
+/// shader source for Metal.
+#[cfg(not(metal_driver))]
 macro_rules! spirv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
+    };
+}
+#[cfg(metal_driver)]
+macro_rules! spirv {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".metal"))
     };
 }
 

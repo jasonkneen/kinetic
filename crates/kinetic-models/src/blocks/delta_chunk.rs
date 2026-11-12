@@ -6,6 +6,8 @@
 //! pass over the state per token. The result equals the token-by-token
 //! recurrence up to floating-point rounding.
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -13,7 +15,6 @@ use std::arch::x86_64::*;
 /// state cost the same at any size, while the intra-chunk terms grow with it.
 /// The last chunk of a batch is padded with tokens that
 /// leave the state unchanged, so every product has fixed dimensions.
-#[cfg(target_arch = "x86_64")]
 const CHUNK: usize = 16;
 
 /// One token's inputs to a head.
@@ -28,16 +29,18 @@ pub(super) struct Token<'a> {
 
 /// Whether [`run`] can handle heads of these dimensions on this CPU.
 pub(super) fn available(dk: usize, dv: usize) -> bool {
+    let fits = dk.is_multiple_of(16) && dv.is_multiple_of(16);
     #[cfg(target_arch = "x86_64")]
     {
-        dk.is_multiple_of(16)
-            && dv.is_multiple_of(16)
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
+        fits && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        let _ = (dk, dv);
+        fits
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = fits;
         false
     }
 }
@@ -60,6 +63,22 @@ pub(super) fn run<'a>(
     unsafe {
         run_avx2(s, out, dk, dv, token)
     }
+    #[cfg(target_arch = "aarch64")]
+    run_chunks(s, out, dk, dv, token)
+}
+
+/// [`run_chunks`] compiled for AVX2, so that its element-wise loops use it
+/// as the products do.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn run_avx2<'a>(
+    s: &mut [f32],
+    out: &mut [f32],
+    dk: usize,
+    dv: usize,
+    token: impl Fn(usize) -> Token<'a>,
+) {
+    run_chunks(s, out, dk, dv, token)
 }
 
 /// With `H = S^T` and, within a chunk, `G_t` the product of the decays up to
@@ -67,9 +86,8 @@ pub(super) fn run<'a>(
 /// `(I + A) D = b (V - G K H)` with `A_tj = b_t (k_t . k_j) G_t / G_j` for
 /// `j < t`; the outputs are `G_t q_t H + sum_{j <= t} (q_t . k_j) G_t / G_j d_j`
 /// and the state becomes `G_C H + sum_j (G_C / G_j) k_j d_j`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-fn run_avx2<'a>(
+#[inline(always)]
+fn run_chunks<'a>(
     s: &mut [f32],
     out: &mut [f32],
     dk: usize,
@@ -172,7 +190,6 @@ fn run_avx2<'a>(
     transpose(&h, s, dk, dv);
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Writes the transpose of `a`, `rows` x `cols`, to `at`.
 fn transpose(a: &[f32], at: &mut [f32], rows: usize, cols: usize) {
     for (r, row) in a.chunks_exact(cols).take(rows).enumerate() {
@@ -183,7 +200,6 @@ fn transpose(a: &[f32], at: &mut [f32], rows: usize, cols: usize) {
 }
 
 /// Which part of a product is known to vanish.
-#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Triangle {
     None,
@@ -197,8 +213,16 @@ enum Triangle {
 /// `c` (`m` x `n`), with `m` a multiple of 4 and `n` a multiple of 16. Each
 /// 16-column panel of `b` stays in L1 while every row block passes over it.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
 fn gemm(a: &[f32], b: &[f32], c: &mut [f32], k: usize, tri: Triangle, beta: f32) {
+    // SAFETY: `run` is the only way here, after `available` confirmed
+    // AVX2 and FMA.
+    unsafe { gemm_avx2(a, b, c, k, tri, beta) }
+}
+
+/// [`gemm`] with AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn gemm_avx2(a: &[f32], b: &[f32], c: &mut [f32], k: usize, tri: Triangle, beta: f32) {
     let (m, n) = (a.len() / k, b.len() / k);
     assert!(m.is_multiple_of(4) && n.is_multiple_of(16));
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n);
@@ -231,6 +255,52 @@ fn gemm(a: &[f32], b: &[f32], c: &mut [f32], k: usize, tri: Triangle, beta: f32)
                         cp,
                         _mm256_fmadd_ps(_mm256_loadu_ps(cp), beta, acc[2 * r + 1]),
                     );
+                }
+            }
+        }
+    }
+}
+
+/// [`gemm`] with NEON, part of every AArch64 CPU: four rows times sixteen
+/// columns in sixteen accumulators of four lanes.
+#[cfg(target_arch = "aarch64")]
+fn gemm(a: &[f32], b: &[f32], c: &mut [f32], k: usize, tri: Triangle, beta: f32) {
+    let (m, n) = (a.len() / k, b.len() / k);
+    assert!(m.is_multiple_of(4) && n.is_multiple_of(16));
+    assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n);
+    // SAFETY: NEON is part of every AArch64 CPU.
+    let beta = unsafe { vdupq_n_f32(beta) };
+    let (a, b, c) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
+    for j in (0..n).step_by(16) {
+        for i in (0..m).step_by(4) {
+            if tri == Triangle::C && j > i + 3 {
+                continue;
+            }
+            let depth = if tri == Triangle::A { k.min(i + 4) } else { k };
+            // SAFETY: the asserts bound every offset: rows `i..i + 4` are
+            // below `m`, columns `j..j + 16` within `n`, and `p` below `k`.
+            unsafe {
+                let mut acc = [vdupq_n_f32(0.0); 16];
+                for p in 0..depth {
+                    let bp = b.add(p * n + j);
+                    let bv = [
+                        vld1q_f32(bp),
+                        vld1q_f32(bp.add(4)),
+                        vld1q_f32(bp.add(8)),
+                        vld1q_f32(bp.add(12)),
+                    ];
+                    for r in 0..4 {
+                        let x = vdupq_n_f32(*a.add((i + r) * k + p));
+                        for (q, bv) in bv.iter().enumerate() {
+                            acc[4 * r + q] = vfmaq_f32(acc[4 * r + q], x, *bv);
+                        }
+                    }
+                }
+                for r in 0..4 {
+                    for q in 0..4 {
+                        let cp = c.add((i + r) * n + j + 4 * q);
+                        vst1q_f32(cp, vfmaq_f32(acc[4 * r + q], vld1q_f32(cp), beta));
+                    }
                 }
             }
         }

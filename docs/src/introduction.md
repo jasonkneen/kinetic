@@ -5,8 +5,8 @@ and .ktc models verified and tuned for your hardware.**
 
 Kinetic runs language, embedding and reranking models on your own computer,
 from one binary with an OpenAI-compatible server. It is written in Rust,
-runs on Windows and Linux (x86-64), on the CPU, on NVIDIA GPUs through CUDA
-and on AMD and Intel GPUs through Vulkan. Kinetic
+runs on Windows and Linux (x86-64) and on macOS (Apple Silicon), on the CPU,
+on NVIDIA GPUs through CUDA and on AMD and Intel GPUs through Vulkan. Kinetic
 never connects to the network, except when you run `kinetic pull`.
 
 ```sh

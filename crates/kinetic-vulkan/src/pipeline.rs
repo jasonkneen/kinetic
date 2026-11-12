@@ -75,12 +75,16 @@ impl Kernel {
             .check("vkCreateShaderModule")?;
         let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
             .required_subgroup_size(SUBGROUP);
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
-            .name(c"main")
-            .push_next(&mut subgroup);
+            .name(c"main");
+        // Where a size cannot be required, the device's own is already
+        // SUBGROUP; `DeviceInfo::missing` refused every other device.
+        if device.info().features.subgroup_size_required {
+            stage = stage.push_next(&mut subgroup);
+        }
         let info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(kernel.layout)];

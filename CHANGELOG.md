@@ -6,6 +6,28 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
 
 ## [Unreleased]
 
+### Platforms
+
+- macOS on Apple Silicon, on the CPU: NEON kernels with SDOT for the
+  K-quants, Q8_0 and Q4_0, f16 and bf16 weights, activation quantization
+  and the chunked delta rule; `kinetic doctor` reports the machine; the
+  default thread count is the performance cores.
+- The GPU of Apple Silicon Macs, through Metal, with no driver to install:
+  the Vulkan kernels are written out as Metal shaders at build time and a
+  Metal driver runs them (`--device metal`). Its GEMV kernels take a tile
+  of four rows per invocation and their block sums in float, which is
+  faster on a Mac's GPU and changes no result. A `macos-arm64-metal`
+  archive and a Python wheel are built for every release.
+- Built without the `metal` feature, the Vulkan backend also runs on a Mac
+  through MoltenVK or KosmicKrisp: it opts into portability drivers, finds
+  Homebrew's loader and accepts devices whose subgroups are 32 wide without
+  being asked.
+
+### Fixed
+
+- Vulkan: a recorded command graph kept resetting a timestamp query pool
+  that had been destroyed with its recording. Drivers on Metal crashed on it.
+
 ### Models
 
 - Gemma 4 (`gemma4`) on the CPU and CUDA, with images through its `gemma4v`

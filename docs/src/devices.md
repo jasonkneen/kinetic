@@ -1,7 +1,8 @@
 # Devices and offload
 
-Kinetic runs on x86-64 CPUs, on NVIDIA GPUs through CUDA and on AMD, Intel
-and NVIDIA GPUs through Vulkan, on Windows and Linux. A model larger than the
+Kinetic runs on x86-64 and Apple Silicon CPUs, on NVIDIA GPUs through CUDA
+and on AMD, Intel and NVIDIA GPUs through Vulkan, on Windows, Linux and
+macOS. A model larger than the
 GPU can still use it: a dense model splits its layers between the GPU and the
 CPU, and a mixture-of-experts model keeps its experts in system memory.
 
@@ -48,7 +49,17 @@ Intel CPUs have since Haswell (2013) and AMD CPUs since Excavator and every
 Ryzen; Kinetic detects them at runtime. Without them it still runs, on a
 much slower path.
 
-`-t` sets the number of threads; by default Kinetic uses every logical CPU.
+On Apple Silicon the kernels use NEON and the SDOT instruction, which every
+M-series chip has.
+
+## Apple GPUs
+
+On a Mac, `--device metal` (or `vulkan`, the same device) runs the Vulkan
+kernels through Metal itself, with nothing to install. `auto` picks it.
+
+`-t` sets the number of threads; by default Kinetic uses every logical CPU,
+except on macOS, where it uses the performance cores: a step that waits for
+an efficiency core is slower than one that leaves it idle.
 Generation is limited by memory bandwidth, so more threads than physical
 cores rarely help, and on some machines fewer threads are faster. Measure
 with `kinetic bench model.gguf --device cpu -t N`.
@@ -118,7 +129,7 @@ against. It is off by default. The CPU and Vulkan paths ignore it.
 
 **Warm Start keeps prompt states** in up to 1 GiB of RAM and 2 GiB on disk,
 under `--cache-dir` (by default `kinetic/warm` in `%LOCALAPPDATA%` on
-Windows and `$XDG_CACHE_HOME` or `~/.cache` on Linux). `--no-prompt-cache`
+Windows and `$XDG_CACHE_HOME` or `~/.cache` on Linux and macOS). `--no-prompt-cache`
 turns it off.
 
 `kinetic bench` reports the peak memory of a run.

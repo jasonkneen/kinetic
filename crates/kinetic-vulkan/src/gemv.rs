@@ -12,7 +12,12 @@ use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
 /// Rows per workgroup; each row gets one subgroup of 32.
+#[cfg(not(metal_driver))]
 const ROWS_PER_GROUP: usize = 4;
+/// Rows per workgroup of the GEMV kernels in `shaders/metal`: four
+/// subgroups of 32, each taking a tile of four rows.
+#[cfg(metal_driver)]
+const ROWS_PER_GROUP: usize = 16;
 /// Elements per scale in the int8 copy of the input.
 const Q8_BLOCK: usize = 32;
 /// Invocations per workgroup of quantize_q8.wgsl, one per block of 32.

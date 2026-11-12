@@ -202,6 +202,10 @@ fn cpu_class() -> String {
     {
         return format!("cpu-{arch}-avx2");
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return format!("cpu-{arch}-neon");
+    }
     format!("cpu-{arch}-scalar")
 }
 
