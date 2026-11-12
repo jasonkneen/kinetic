@@ -3,7 +3,8 @@ use std::rc::Rc;
 use ash::vk;
 
 use crate::error::{Check, Error, Result};
-use crate::physical::{DeviceInfo, PhysicalDevice};
+use crate::info::DeviceInfo;
+use crate::physical::PhysicalDevice;
 
 /// Memory property bits of AMD's device-coherent types, which need a feature
 /// this crate does not enable.

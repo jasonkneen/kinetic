@@ -1,11 +1,13 @@
 #!/bin/sh
-# Installs Kinetic for the current user on Linux x86-64.
+# Installs Kinetic for the current user on Linux x86-64 and on macOS on
+# Apple Silicon.
 #
-# Downloads a Kinetic release from GitHub (the full build, which runs on
-# NVIDIA GPUs through CUDA, on AMD and Intel GPUs through Vulkan and on the
-# CPU; --cpu takes the smaller CPU-only build), checks it against the
-# release's SHA256SUMS and installs it into ~/.local/bin, with its C library
-# and header in ~/.local/lib and ~/.local/include. Needs no root.
+# Downloads a Kinetic release from GitHub (on Linux the full build, which
+# runs on NVIDIA GPUs through CUDA, on AMD and Intel GPUs through Vulkan and
+# on the CPU; --cpu takes the smaller CPU-only build; macOS has one build,
+# for the GPU through Metal and the CPU), checks it against the release's SHA256SUMS and installs it into
+# ~/.local/bin, with its C library and header in ~/.local/lib and
+# ~/.local/include. Needs no root.
 #
 #   curl -fsSL https://raw.githubusercontent.com/Veloresearch/kinetic/main/scripts/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --version 0.1.0 --cpu
@@ -35,8 +37,13 @@ fail() {
     exit 1
 }
 
-[ "$(uname -s)" = Linux ] || fail "this script is for Linux; on Windows use install.ps1"
-[ "$(uname -m)" = x86_64 ] || fail "Kinetic is built for x86-64, not $(uname -m)"
+case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64) target=linux-x86_64 ;;
+    Darwin/arm64) target=macos-arm64 ;;
+    Linux/*) fail "Kinetic is built for x86-64 Linux, not $(uname -m)" ;;
+    Darwin/*) fail "Kinetic is built for Apple Silicon Macs, not $(uname -m)" ;;
+    *) fail "this script is for Linux and macOS; on Windows use install.ps1" ;;
+esac
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL "$1" -o "$2"; }
@@ -64,10 +71,14 @@ if [ -z "$version" ]; then
 fi
 version="${version#v}"
 
-# the cuda archive is the full build: CUDA, Vulkan and the CPU in one binary
+# the cuda archive is the full build: CUDA, Vulkan and the CPU in one binary;
+# macOS has one build, with Metal and the CPU
+if [ "$target" = macos-arm64 ]; then
+    variant=metal
+fi
 [ -n "$variant" ] || variant=cuda
 
-name="kinetic-${version}-linux-x86_64-${variant}"
+name="kinetic-${version}-${target}-${variant}"
 base="https://github.com/$repo/releases/download/v${version}"
 echo "Downloading Kinetic ${version} (${variant} build)"
 fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"

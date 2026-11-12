@@ -7,7 +7,8 @@ use std::rc::Rc;
 use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
-    Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels,
+    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels, Out,
+    Rows,
 };
 
 struct Gpu {
@@ -144,6 +145,87 @@ fn check(ty: TensorType, rows: usize, cols: usize) {
 
 // 37 rows leave the last workgroup partly empty; 5 K-quant blocks per row
 // leave some invocation groups without a block on the second step.
+
+/// A pass recorded as one of many prompt tokens, which a driver may run
+/// with kernels written for many tokens: every output has the bits the
+/// same pass has without that, at the stride and offset asked for, and the
+/// slots between the rows stay as they were.
+fn check_prompt_pass(ty: TensorType, rows: usize, cols: usize, held: usize, tokens: usize) {
+    for gpu in gpus() {
+        let mut rng = Lcg(ty as u64 + 11 + rows as u64);
+        let data = random_matrix(ty, rows, cols, &mut rng);
+        let m = Matrix::new(ty, &data, rows, cols);
+        let x: Vec<f32> = (0..held * cols).map(|_| rng.f32() * 3.0).collect();
+        let out = Out {
+            stride: rows + 8,
+            offset: 3,
+        };
+        let w = DeviceMatrix::upload(&gpu.device, &m).unwrap();
+        let mut input = GemvInput::batch(&gpu.device, cols, held).unwrap();
+        let mut batch = Batch::new(&gpu.device, held, 1, 64, 0).unwrap();
+        batch.set(tokens, 0, 0..0, None).unwrap();
+        let mut run = |prompt: bool| {
+            let y =
+                DeviceBuffer::from_slice(&gpu.device, &vec![-7.5f32; held * out.stride]).unwrap();
+            let mut commands = Commands::new(&gpu.device).unwrap();
+            commands.set_prompt(prompt);
+            batch.record_upload(&mut commands).unwrap();
+            input.upload(&gpu.kernels, &x, &mut commands).unwrap();
+            gpu.kernels
+                .gemv_rows(&w, &input, &y, out, Rows::Tokens, &batch, &mut commands)
+                .unwrap();
+            commands.submit().unwrap();
+            y.to_vec().unwrap()
+        };
+        let (alone, many) = (run(false), run(true));
+        let name = &gpu.device.info().name;
+        for t in 0..held {
+            for i in 0..out.stride {
+                let (a, b) = (alone[t * out.stride + i], many[t * out.stride + i]);
+                let written = t < tokens && (out.offset..out.offset + rows).contains(&i);
+                if !written {
+                    assert_eq!(b, -7.5, "{name}: {ty} token {t} slot {i} was written");
+                }
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name}: {ty} token {t} slot {i}: {a} alone, {b} in a prompt pass"
+                );
+            }
+        }
+        // And the pass is not all zeros or the test above says little.
+        assert!(many.iter().any(|v| *v != 0.0 && *v != -7.5));
+    }
+}
+
+// 37 rows leave the last workgroup of either kernel partly empty; 21 tokens
+// of 32 leave the second run over the weights partly empty.
+#[test]
+fn q4_k_prompt_pass_has_the_same_bits() {
+    check_prompt_pass(TensorType::Q4K, 37, 5 * 256, 32, 21);
+    check_prompt_pass(TensorType::Q4K, 128, 3 * 256, 64, 64);
+    check_prompt_pass(TensorType::Q4K, 3, 256, 16, 1);
+}
+
+#[test]
+fn q6_k_prompt_pass_has_the_same_bits() {
+    check_prompt_pass(TensorType::Q6K, 37, 5 * 256, 32, 21);
+    check_prompt_pass(TensorType::Q6K, 128, 3 * 256, 64, 64);
+    check_prompt_pass(TensorType::Q6K, 3, 256, 16, 1);
+}
+
+#[test]
+fn q5_k_prompt_pass_has_the_same_bits() {
+    check_prompt_pass(TensorType::Q5K, 37, 5 * 256, 32, 21);
+    check_prompt_pass(TensorType::Q5K, 128, 3 * 256, 64, 64);
+    check_prompt_pass(TensorType::Q5K, 3, 256, 16, 1);
+}
+
+// Types without a kernel for many tokens take the one they always take.
+#[test]
+fn q8_0_prompt_pass_has_the_same_bits() {
+    check_prompt_pass(TensorType::Q8_0, 37, 2 * 256, 32, 21);
+}
 
 #[test]
 fn q4_k_matches_reference() {

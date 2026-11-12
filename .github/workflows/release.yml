@@ -26,6 +26,7 @@ jobs:
           - { os: ubuntu-22.04, target: linux-x86_64, variant: cuda }
           - { os: windows-2022, target: windows-x86_64, variant: cpu }
           - { os: windows-2022, target: windows-x86_64, variant: cuda }
+          - { os: macos-15, target: macos-arm64, variant: metal }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +55,8 @@ jobs:
         run: |
           features=(--no-default-features)
           if [ "${{ matrix.variant }}" = cuda ]; then features=(--features cuda); fi
+          # no CUDA on macOS; there the vulkan feature drives Metal itself
+          if [ "${{ matrix.variant }}" = metal ]; then features=(--no-default-features --features vulkan); fi
           cargo build --release --locked -p kinetic-cli "${features[@]}"
           cargo build --release --locked -p kinetic-capi
 
@@ -75,10 +78,14 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then
             cp target/release/kinetic.exe "$name/"
             cp target/release/kinetic_capi.dll target/release/kinetic_capi.dll.lib "$name/lib/"
+          elif [ "$RUNNER_OS" = macOS ]; then
+            cp target/release/kinetic "$name/"
+            cp target/release/libkinetic_capi.dylib "$name/lib/"
           else
             cp target/release/kinetic "$name/"
             cp target/release/libkinetic_capi.so "$name/lib/"
           fi
+          if [ "$RUNNER_OS" = macOS ]; then sha256sum() { shasum -a 256 "$@"; }; fi
           (cd "$name" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
           if [ "$RUNNER_OS" = Windows ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
@@ -99,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        os: [ubuntu-22.04, windows-2022, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

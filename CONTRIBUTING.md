@@ -35,7 +35,8 @@ No time to write it? Open a "Support a new model family" issue.
 
 ## Building
 
-You need Rust 1.91 or newer, on Windows or Linux (x86-64).
+You need Rust 1.91 or newer, on Windows or Linux (x86-64) or on macOS
+(Apple Silicon).
 
 ```sh
 cargo build --release -p kinetic-cli
