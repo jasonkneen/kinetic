@@ -20,7 +20,7 @@ pub fn gpus() -> (Vec<Gpu>, Vec<String>) {
     let mut notes = Vec::new();
     for (api, probe) in [
         ("CUDA", cuda as fn() -> Result<Vec<Gpu>, String>),
-        ("Vulkan", vulkan),
+        (crate::gpu::VULKAN, vulkan),
     ] {
         match probe() {
             Ok(g) if g.is_empty() => notes.push(format!("{api}: no devices")),
@@ -79,12 +79,16 @@ fn vulkan() -> Result<Vec<Gpu>, String> {
             let info = d.info();
             let (major, minor, patch) = info.api_version;
             Gpu {
-                api: "Vulkan",
+                api: kinetic_vulkan::API,
                 name: info.name.clone(),
-                driver: format!(
-                    "{} {}, Vulkan {major}.{minor}.{patch}",
-                    info.driver_name, info.driver_info
-                ),
+                // Metal is its own driver and has no version to report.
+                driver: match kinetic_vulkan::API {
+                    "Vulkan" => format!(
+                        "{} {}, Vulkan {major}.{minor}.{patch}",
+                        info.driver_name, info.driver_info
+                    ),
+                    api => api.to_owned(),
+                },
                 memory_total: info.device_local_bytes,
                 memory_free: None,
                 bandwidth: None,

@@ -6,10 +6,18 @@ use crate::error::{Error, Result};
 use crate::memory::DeviceBuffer;
 use crate::pipeline::Kernel;
 
-/// SPIR-V written by build.rs.
+/// A kernel as build.rs wrote it for the driver: SPIR-V for Vulkan, Metal
+/// shader source for Metal.
+#[cfg(not(metal_driver))]
 macro_rules! spirv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
+    };
+}
+#[cfg(metal_driver)]
+macro_rules! spirv {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".metal"))
     };
 }
 
@@ -41,6 +49,9 @@ pub struct Kernels {
     pub(crate) attend_128: Rc<Kernel>,
     pub(crate) attend_256: Rc<Kernel>,
     read_sum: Rc<Kernel>,
+    /// The matrix product of a prompt batch; see `shaders/metal`.
+    #[cfg(metal_driver)]
+    pub(crate) gemm_f16: Rc<Kernel>,
     /// The batch words of a pass of one token, for GEMVs outside a model.
     pub(crate) single: DeviceBuffer<u32>,
 }
@@ -70,6 +81,14 @@ impl Kernels {
             attend_128: attend("attend_128", spirv!("attend_128"))?,
             attend_256: attend("attend_256", spirv!("attend_256"))?,
             read_sum: Kernel::new(device, "read_sum", spirv!("read_sum"), 2, 1)?,
+            #[cfg(metal_driver)]
+            gemm_f16: Kernel::new(
+                device,
+                "gemm_f16",
+                include_bytes!("../shaders/metal/gemm_f16.metal"),
+                4,
+                4,
+            )?,
             single: DeviceBuffer::from_slice(device, &[1, 0, 0, 1])?,
         })
     }

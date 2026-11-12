@@ -1,7 +1,7 @@
 # Install
 
-Kinetic runs on Windows 10 and 11 and on Linux, on x86-64. Pick one way to
-install it.
+Kinetic runs on Windows 10 and 11 and on Linux, on x86-64, and on macOS on
+Apple Silicon. Pick one way to install it.
 
 ## Install script
 
@@ -16,8 +16,9 @@ curl -fsSL https://raw.githubusercontent.com/Veloresearch/kinetic/main/scripts/i
 The scripts download the latest release (the full build, which runs on NVIDIA
 GPUs through CUDA, on AMD and Intel GPUs through Vulkan and on the CPU), check it against the release's `SHA256SUMS` and install it for the
 current user: into `%LOCALAPPDATA%\Programs\kinetic`, put on the user `PATH`, on
-Windows, and into `~/.local/bin` on Linux. `-Version 0.1.0` / `--version 0.1.0`
-picks a release and `-Cpu` / `--cpu` the smaller CPU-only build.
+Windows, and into `~/.local/bin` on Linux and macOS. `-Version 0.1.0` /
+`--version 0.1.0` picks a release and `-Cpu` / `--cpu` the smaller CPU-only
+build. macOS has one build, which uses the GPU through Metal.
 
 ## Release binaries
 
@@ -30,6 +31,7 @@ take the archive for your system:
 | `kinetic-<version>-windows-x86_64-cpu.zip` | Windows, CPU only |
 | `kinetic-<version>-linux-x86_64-cuda.tar.gz` | Linux, with NVIDIA GPU support |
 | `kinetic-<version>-linux-x86_64-cpu.tar.gz` | Linux, CPU only |
+| `kinetic-<version>-macos-arm64-metal.tar.gz` | macOS on Apple Silicon, GPU through Metal and CPU |
 
 The `cuda` archives also run on machines without a GPU, on the CPU; they are
 the right choice unless you want the smallest download. They need only the
@@ -68,8 +70,8 @@ it; see [FAQ](faq.md#windows-says-the-file-is-not-commonly-downloaded).
 pip install kinetic-engine
 ```
 
-Wheels are built for Windows and Linux (manylinux 2.28) on x86-64, for
-Python 3.9 and newer. They run models on the CPU; to use an NVIDIA GPU from
+Wheels are built for Windows and Linux (manylinux 2.28) on x86-64 and for
+macOS on Apple Silicon, for Python 3.9 and newer. They run models on the CPU; to use an NVIDIA GPU from
 Python, [build the package from source](building.md#the-libraries) with the
 CUDA toolkit installed, or run `kinetic serve` and use any OpenAI client.
 See [Python, C and Rust](bindings.md) for the API.

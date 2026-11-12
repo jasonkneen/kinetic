@@ -11,6 +11,12 @@
 //! lacks. Integrated GPUs whose device-local heap is small keep buffers in
 //! system memory instead.
 //!
+//! With the `metal` feature on macOS the same kernels, written out as Metal
+//! shaders at build time, run through Metal itself: the six driver modules
+//! are replaced by those in `src/metal`, and nothing above them changes.
+//! That driver adds one kernel of its own, for prompt batches; see
+//! [`Commands::set_prompt`].
+//!
 //! The decode-path GEMV kernels compute `y = W x` for one f32 vector. Float
 //! weights read `x` as f32; quantized weights read an int8 copy of `x`, in
 //! blocks of 32 with one scale each, made by [`GemvInput::upload`], and use
@@ -37,20 +43,63 @@
 mod argmax;
 mod attention;
 mod batch;
-mod commands;
 mod delta_net;
-mod device;
 mod error;
 mod ffn;
 mod gemv;
-mod instance;
+mod info;
 mod kernels;
 mod layout;
-mod memory;
 mod norm;
-mod physical;
-mod pipeline;
 mod short_conv;
+
+// The driver: what opens the device, holds its memory, builds its kernels
+// and runs them. Everything above is written against these six modules.
+#[cfg(not(metal_driver))]
+mod commands;
+#[cfg(not(metal_driver))]
+mod device;
+#[cfg(not(metal_driver))]
+mod instance;
+#[cfg(not(metal_driver))]
+mod memory;
+#[cfg(not(metal_driver))]
+mod physical;
+#[cfg(not(metal_driver))]
+mod pipeline;
+
+#[cfg(metal_driver)]
+#[path = "metal/commands.rs"]
+mod commands;
+#[cfg(metal_driver)]
+#[path = "metal/device.rs"]
+mod device;
+#[cfg(metal_driver)]
+#[path = "metal/instance.rs"]
+mod instance;
+#[cfg(metal_driver)]
+#[path = "metal/memory.rs"]
+mod memory;
+#[cfg(metal_driver)]
+#[path = "metal/physical.rs"]
+mod physical;
+#[cfg(metal_driver)]
+#[path = "metal/pipeline.rs"]
+mod pipeline;
+
+/// What drives the GPU: Vulkan, or Metal with the `metal` feature on macOS.
+#[cfg(not(metal_driver))]
+pub const API: &str = "Vulkan";
+#[cfg(metal_driver)]
+pub const API: &str = "Metal";
+
+/// Most tokens worth running as one prompt pass, or 0 for a driver with no
+/// kernel of its own for prompt batches; see [`Commands::set_prompt`].
+/// Such a kernel reads the weights once however many tokens there are.
+#[cfg(not(metal_driver))]
+pub const PROMPT_BATCH: usize = 0;
+#[cfg(metal_driver)]
+pub const PROMPT_BATCH: usize = 512;
 
 pub use attention::{AttentionGate, AttentionShape, KvCache, QkvConsts};
 pub use batch::{Batch, BATCH_HEADER};
@@ -59,9 +108,10 @@ pub use delta_net::{DeltaShape, DeltaState, DeltaWeights};
 pub use device::Device;
 pub use error::{Error, Result};
 pub use gemv::{DeviceMatrix, GemvInput, Out, Rows};
+pub use info::{DeviceInfo, DeviceKind, Features};
 pub use instance::Instance;
 pub use kernels::Kernels;
 pub use memory::{DeviceBuffer, DeviceCopy, HostBuffer};
 pub use norm::Residual;
-pub use physical::{DeviceInfo, DeviceKind, Features, PhysicalDevice};
+pub use physical::PhysicalDevice;
 pub use short_conv::ConvRing;

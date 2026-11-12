@@ -23,6 +23,28 @@ pub(crate) fn device_layout<'a>(m: &Matrix<'a>) -> Cow<'a, [u8]> {
     Cow::Owned(planar(m.data, m.ty.block_bytes(), fields))
 }
 
+/// The bytes of a matrix of `ty` as its file holds them, from `device`,
+/// what [`device_layout`] made of them.
+#[cfg(metal_driver)]
+pub(crate) fn file_layout(ty: TensorType, device: &[u8]) -> Cow<'_, [u8]> {
+    let fields = match ty {
+        TensorType::Q6K => Q6_K_FIELDS,
+        TensorType::Q8_0 => Q8_0_FIELDS,
+        _ => return Cow::Borrowed(device),
+    };
+    let block_bytes = ty.block_bytes();
+    let blocks = device.len() / block_bytes;
+    let mut out = vec![0; blocks * block_bytes];
+    let mut plane = 0;
+    for &(start, len) in fields {
+        for (b, block) in out.chunks_exact_mut(block_bytes).enumerate() {
+            block[start..start + len].copy_from_slice(&device[plane + b * len..][..len]);
+        }
+        plane += blocks * len;
+    }
+    Cow::Owned(out)
+}
+
 fn planar(data: &[u8], block_bytes: usize, fields: &[(usize, usize)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for &(start, len) in fields {
@@ -44,6 +66,16 @@ mod tests {
         let out = device_layout(&m);
         let expected: Vec<u8> = (2..34).chain(36..68).chain([0, 1, 34, 35]).collect();
         assert_eq!(*out, expected[..]);
+    }
+
+    #[cfg(metal_driver)]
+    #[test]
+    fn file_layout_undoes_device_layout() {
+        for (ty, bytes, cols) in [(TensorType::Q8_0, 34, 32), (TensorType::Q6K, 210, 256)] {
+            let blocks: Vec<u8> = (0..3 * bytes).map(|i| (i * 7) as u8).collect();
+            let m = Matrix::new(ty, &blocks, 1, 3 * cols);
+            assert_eq!(*file_layout(ty, &device_layout(&m)), blocks[..]);
+        }
     }
 
     #[test]

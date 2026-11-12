@@ -12,7 +12,12 @@ use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
 /// Rows per workgroup; each row gets one subgroup of 32.
+#[cfg(not(metal_driver))]
 const ROWS_PER_GROUP: usize = 4;
+/// Rows per workgroup of the GEMV kernels in `shaders/metal`: four
+/// subgroups of 32, each taking a tile of four rows.
+#[cfg(metal_driver)]
+const ROWS_PER_GROUP: usize = 16;
 /// Elements per scale in the int8 copy of the input.
 const Q8_BLOCK: usize = 32;
 /// Invocations per workgroup of quantize_q8.wgsl, one per block of 32.
@@ -36,6 +41,13 @@ pub struct DeviceMatrix {
     cols: usize,
     bytes: usize,
     data: DeviceBuffer<u8>,
+    /// The weights as f16 in row order, for the prompt kernel: made the
+    /// first time a prompt pass is recorded with this matrix, and `None`
+    /// where that kernel cannot take it.
+    #[cfg(metal_driver)]
+    half: std::cell::OnceCell<Option<DeviceBuffer<u16>>>,
+    #[cfg(metal_driver)]
+    device: Rc<Device>,
 }
 
 impl DeviceMatrix {
@@ -61,6 +73,10 @@ impl DeviceMatrix {
             cols: m.cols,
             bytes: m.data.len(),
             data: DeviceBuffer::from_slice(device, &data)?,
+            #[cfg(metal_driver)]
+            half: std::cell::OnceCell::new(),
+            #[cfg(metal_driver)]
+            device: Rc::clone(device),
         })
     }
 
@@ -79,6 +95,75 @@ impl DeviceMatrix {
     /// Bytes of weights, which a GEMV reads once.
     pub fn size_bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+/// Rows a threadgroup of the prompt kernel takes; the last may have fewer.
+#[cfg(metal_driver)]
+const GEMM_ROWS: usize = 64;
+/// Tokens a threadgroup of the prompt kernel takes; it runs them all, so
+/// a batch must hold a multiple of them.
+#[cfg(metal_driver)]
+const GEMM_TOKENS: usize = 32;
+/// Columns the prompt kernel takes at a time.
+#[cfg(metal_driver)]
+const GEMM_COLS: usize = 32;
+
+#[cfg(metal_driver)]
+impl DeviceMatrix {
+    /// The f16 copy the prompt kernel reads, made on first use.
+    fn half(&self) -> Result<Option<&DeviceBuffer<u16>>> {
+        if self.half.get().is_none() {
+            let made = match self.cols.is_multiple_of(GEMM_COLS) {
+                true => self.dequantized()?,
+                false => None,
+            };
+            // Only this thread uses the device, so nothing set it meanwhile.
+            let _ = self.half.set(made);
+        }
+        Ok(self.half.get().and_then(Option::as_ref))
+    }
+
+    /// Every weight as f16, or `None` for a type that cannot be dequantized
+    /// or a matrix too large for one buffer. The rows are spread over the
+    /// CPU's threads: a model has gigabytes of them.
+    fn dequantized(&self) -> Result<Option<DeviceBuffer<u16>>> {
+        let elements = self.rows * self.cols;
+        if 2 * elements as u64 > self.device.info().max_buffer_bytes {
+            return Ok(None);
+        }
+        let device_bytes = self.data.to_vec()?;
+        let file = crate::layout::file_layout(self.ty, &device_bytes[..self.bytes]);
+        let row_bytes = self.bytes / self.rows;
+        let (ty, cols) = (self.ty, self.cols);
+        let mut out = vec![0u16; elements];
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let rows_per_thread = self.rows.div_ceil(threads).max(1);
+        let ok = std::thread::scope(|scope| {
+            let tasks: Vec<_> = out
+                .chunks_mut(rows_per_thread * cols)
+                .zip(file.chunks(rows_per_thread * row_bytes))
+                .map(|(out, rows)| {
+                    scope.spawn(move || {
+                        let mut row = vec![0.0f32; cols];
+                        for (out, bytes) in out.chunks_mut(cols).zip(rows.chunks(row_bytes)) {
+                            if kinetic_quant::dequantize(ty, bytes, &mut row).is_err() {
+                                return false;
+                            }
+                            for (h, &v) in out.iter_mut().zip(&row) {
+                                *h = half::f16::from_f32(v).to_bits();
+                            }
+                        }
+                        true
+                    })
+                })
+                .collect();
+            tasks.into_iter().all(|t| t.join().unwrap_or(false))
+        });
+        match ok {
+            true => DeviceBuffer::from_slice(&self.device, &out).map(Some),
+            false => Ok(None),
+        }
     }
 }
 
@@ -276,6 +361,39 @@ impl Kernels {
                 out.stride,
                 out.offset
             )));
+        }
+        #[cfg(metal_driver)]
+        if rows == Rows::Tokens && commands.prompt() && batch.rows().is_multiple_of(GEMM_TOKENS) {
+            if let Some(half) = w.half()? {
+                // SAFETY: matches gemm_f16.metal: the f16 weights, x, y and
+                // the batch at buffers 0..3, then rows, columns, output
+                // stride and offset. It reads `rows * cols` weights and at
+                // most every row of `x` the batch can hold, and writes as
+                // many rows of `y`, all checked above.
+                unsafe {
+                    commands.dispatch(
+                        &self.gemm_f16,
+                        &[
+                            half.allocation(),
+                            x.x.allocation(),
+                            y.allocation(),
+                            batch.device().allocation(),
+                        ],
+                        &[
+                            w.rows as u32,
+                            w.cols as u32,
+                            out.stride as u32,
+                            out.offset as u32,
+                        ],
+                        [
+                            w.rows.div_ceil(GEMM_ROWS) as u32,
+                            (batch.rows() / GEMM_TOKENS) as u32,
+                            1,
+                        ],
+                    )
+                };
+                return Ok(());
+            }
         }
         // SAFETY: checked above: `x` holds every row the batch can name and
         // `y` every output row it can ask for.

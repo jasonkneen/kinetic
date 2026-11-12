@@ -4,8 +4,14 @@ use kinetic_models::LoadError;
 
 use crate::{Device, Result};
 
+/// What `--device vulkan` runs through: Vulkan, or on macOS Metal.
+#[cfg(feature = "vulkan")]
+pub const VULKAN: &str = kinetic_vulkan::API;
+#[cfg(not(feature = "vulkan"))]
+pub const VULKAN: &str = "Vulkan";
+
 /// The GPU kinds in the order `auto` tries them, with their names.
-const ORDER: [(Device, &str); 2] = [(Device::Cuda, "CUDA"), (Device::Vulkan, "Vulkan")];
+const ORDER: [(Device, &str); 2] = [(Device::Cuda, "CUDA"), (Device::Vulkan, VULKAN)];
 
 /// The first backend that `start` makes for a GPU kind `device` allows,
 /// and its kind; `None` when the model should run on the CPU. `start`

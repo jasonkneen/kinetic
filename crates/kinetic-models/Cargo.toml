@@ -45,3 +45,8 @@ required-features = ["vulkan"]
 [[example]]
 name = "flywheel"
 required-features = ["cuda"]
+
+# On macOS the executor drives the GPU through Metal itself, which needs no
+# driver installed; see the `metal` feature of kinetic-vulkan.
+[target.'cfg(target_os = "macos")'.dependencies]
+kinetic-vulkan = { path = "../kinetic-vulkan", optional = true, features = ["metal"] }

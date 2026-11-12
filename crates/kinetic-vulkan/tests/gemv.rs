@@ -7,7 +7,8 @@ use std::rc::Rc;
 use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
-    Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels,
+    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels, Out,
+    Rows,
 };
 
 struct Gpu {
@@ -140,6 +141,98 @@ fn check(ty: TensorType, rows: usize, cols: usize) {
             );
         }
     }
+}
+
+/// A full batch recorded as prompt processing, which a driver may run with
+/// a kernel of its own: every token's product is the dequantized matrix
+/// times its input, to what the weights' and inputs' rounding allows, at
+/// the stride and offset asked for, and the same bits on every run.
+fn check_prompt_batch(ty: TensorType, rows: usize, cols: usize) {
+    // A batch that holds 64 tokens and runs 40: a prompt kernel that takes
+    // them in groups leaves one partly filled.
+    const HELD: usize = 64;
+    const TOKENS: usize = 40;
+    for gpu in gpus() {
+        let mut rng = Lcg(ty as u64 + 11);
+        let data = random_matrix(ty, rows, cols, &mut rng);
+        let m = Matrix::new(ty, &data, rows, cols);
+        let x: Vec<f32> = (0..HELD * cols).map(|_| rng.f32() * 3.0).collect();
+        let out = Out {
+            stride: rows + 8,
+            offset: 3,
+        };
+
+        let w = DeviceMatrix::upload(&gpu.device, &m).unwrap();
+        let mut input = GemvInput::batch(&gpu.device, cols, HELD).unwrap();
+        let mut batch = Batch::new(&gpu.device, HELD, 1, 64, 0).unwrap();
+        batch.set(TOKENS, 0, 0..0, None).unwrap();
+        let run = |input: &mut GemvInput| {
+            let y = DeviceBuffer::new(&gpu.device, HELD * out.stride).unwrap();
+            let mut commands = Commands::new(&gpu.device).unwrap();
+            commands.set_prompt(true);
+            batch.record_upload(&mut commands).unwrap();
+            input.upload(&gpu.kernels, &x, &mut commands).unwrap();
+            gpu.kernels
+                .gemv_rows(&w, input, &y, out, Rows::Tokens, &batch, &mut commands)
+                .unwrap();
+            commands.submit().unwrap();
+            y.to_vec().unwrap()
+        };
+        let y = run(&mut input);
+        assert_eq!(
+            y[..TOKENS * out.stride]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            run(&mut input)[..TOKENS * out.stride]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "{ty}: a second run gave other bits"
+        );
+
+        let name = &gpu.device.info().name;
+        let mut row = vec![0.0; cols];
+        for r in 0..rows {
+            dequantize(ty, m.row(r), &mut row).unwrap();
+            for t in 0..TOKENS {
+                let xt = &x[t * cols..][..cols];
+                let exact: f64 = row.iter().zip(xt).map(|(&a, &b)| a as f64 * b as f64).sum();
+                let magnitude: f64 = row
+                    .iter()
+                    .zip(xt)
+                    .map(|(&a, &b)| (a as f64 * b as f64).abs())
+                    .sum();
+                // The exact kernels round each input to an int8 of its
+                // block, a prompt kernel may round each weight to f16.
+                let tol = 1e-2 * magnitude + 1e-6;
+                let got = y[t * out.stride + out.offset + r];
+                assert!(
+                    (got as f64 - exact).abs() <= tol,
+                    "{name}: {ty} row {r} token {t}: got {got}, expected {exact}"
+                );
+            }
+        }
+    }
+}
+
+// 128 rows are two threadgroups of a prompt kernel's 64; 3 K-quant blocks
+// per row are 768 columns, 24 of its steps.
+
+#[test]
+fn q4_k_prompt_batch_matches_reference() {
+    check_prompt_batch(TensorType::Q4K, 128, 3 * 256);
+}
+
+#[test]
+fn q6_k_prompt_batch_matches_reference() {
+    check_prompt_batch(TensorType::Q6K, 128, 3 * 256);
+}
+
+// 37 rows leave a prompt kernel's only threadgroup partly empty.
+#[test]
+fn odd_prompt_batch_matches_reference() {
+    check_prompt_batch(TensorType::Q4K, 37, 256);
 }
 
 // 37 rows leave the last workgroup partly empty; 5 K-quant blocks per row

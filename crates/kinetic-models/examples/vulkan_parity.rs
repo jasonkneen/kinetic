@@ -79,19 +79,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("gpu greedy: {}", list.join(","));
     println!("gpu decode: {rate:.1} tokens/s");
 
+    // The prompt runs as a prompt here too: a device may run full prompt
+    // batches with kernels that round differently from a token's alone.
     let mut state = gpu.new_state()?;
-    let mut fed = ids.clone();
-    fed.extend_from_slice(&alone[..n - 1]);
-    let (batched, _) = gpu.run_greedy(&mut state, &fed, true)?;
-    let same = batched[ids.len() - 1..] == alone[..];
+    let (first, _) = gpu.run_greedy(&mut state, &ids, false)?;
+    let (batched, _) = gpu.run_greedy(&mut state, &alone[..n - 1], true)?;
+    let same = first[0] == alone[0] && batched[..] == alone[1..];
     println!("batched rows give the same greedy tokens: {same}");
 
+    // And here: its last token in a draft would not be a prompt token.
     let mut state = gpu.new_state()?;
-    gpu.run_greedy(&mut state, &ids[..ids.len() - 1], false)?;
-    let mut fed = vec![ids[ids.len() - 1]];
-    fed.extend_from_slice(&alone[..n - 1]);
-    let mut drafted = Vec::new();
-    for good in fed.chunks(3) {
+    let (first, _) = gpu.run_greedy(&mut state, &ids, false)?;
+    let mut drafted = vec![first[0]];
+    for good in alone[..n - 1].chunks(3) {
         let mut draft = good.to_vec();
         draft.extend([0, 1, 2]);
         gpu.checkpoint(&mut state)?;

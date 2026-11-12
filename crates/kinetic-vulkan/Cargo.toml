@@ -6,9 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# On macOS, drives the GPU through Metal itself instead of a Vulkan driver
+# layered on it. The kernels are the same WGSL, written out as Metal
+# shaders at build time. No effect on other systems.
+metal = ["dep:half", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "naga/msl-out"]
+
 [dependencies]
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
 kinetic-quant = { path = "../kinetic-quant" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+half = { workspace = true, optional = true }
+objc2 = { version = "0.6.5", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 
 [build-dependencies]
 naga = { version = "30.0.1", default-features = false, features = ["wgsl-in", "spv-out"] }
