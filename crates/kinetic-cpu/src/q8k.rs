@@ -91,9 +91,14 @@ pub(crate) fn quantize_block(src: &[f32], dst: &mut [i8]) -> f32 {
         // SAFETY: AVX2 was just detected.
         return unsafe { simd::quantize_block(src, dst) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU.
+    return unsafe { neon::quantize_block(src, dst) };
+    #[cfg(not(target_arch = "aarch64"))]
     quantize_block_scalar(src, dst)
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn quantize_block_scalar(src: &[f32], dst: &mut [i8]) -> f32 {
     let amax = src.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let d = amax / 127.0;
@@ -158,6 +163,40 @@ mod simd {
         );
         // NaN becomes 0, as `as i8` makes it.
         _mm256_cvttps_epi32(_mm256_and_ps(r, _mm256_cmp_ps(x, x, _CMP_ORD_Q)))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    /// [`super::quantize_block_scalar`], value for value.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn quantize_block(src: &[f32], dst: &mut [i8]) -> f32 {
+        assert_eq!(src.len(), dst.len());
+        assert!(src.len().is_multiple_of(16));
+        // maxnm keeps the other operand when one is NaN, as `f32::max` does.
+        let mut m = vdupq_n_f32(0.0);
+        for c in src.chunks_exact(4) {
+            m = vmaxnmq_f32(m, vabsq_f32(vld1q_f32(c.as_ptr())));
+        }
+        let amax = vmaxnmvq_f32(m);
+
+        let d = amax / 127.0;
+        let inv = vdupq_n_f32(if d == 0.0 { 0.0 } else { 1.0 / d });
+        let (lo, hi) = (vdupq_n_s32(-127), vdupq_n_s32(127));
+        // FCVTAS rounds half away from zero, saturates, and makes NaN 0,
+        // as `round` then `clamp` then `as i8` do.
+        let round4 = |p: &[f32]| {
+            let r = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.as_ptr()), inv));
+            vminq_s32(vmaxq_s32(r, lo), hi)
+        };
+        for (c, out) in src.chunks_exact(16).zip(dst.chunks_exact_mut(16)) {
+            let a = vcombine_s16(vqmovn_s32(round4(&c[..4])), vqmovn_s32(round4(&c[4..8])));
+            let b = vcombine_s16(vqmovn_s32(round4(&c[8..12])), vqmovn_s32(round4(&c[12..])));
+            vst1q_s8(out.as_mut_ptr(), vcombine_s8(vqmovn_s16(a), vqmovn_s16(b)));
+        }
+        d
     }
 }
 

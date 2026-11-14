@@ -12,7 +12,16 @@ use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
 /// Rows per workgroup; each row gets one subgroup of 32.
+#[cfg(not(metal_driver))]
 const ROWS_PER_GROUP: usize = 4;
+/// Rows per workgroup of the GEMV kernels in `shaders/metal`: four
+/// subgroups of 32, each taking a tile of four rows.
+#[cfg(metal_driver)]
+const ROWS_PER_GROUP: usize = 16;
+/// Rows per workgroup of the kernels for many tokens in `shaders/metal`:
+/// four subgroups of two rows.
+#[cfg(metal_driver)]
+const MANY_ROWS_PER_GROUP: usize = 8;
 /// Elements per scale in the int8 copy of the input.
 const Q8_BLOCK: usize = 32;
 /// Invocations per workgroup of quantize_q8.wgsl, one per block of 32.
@@ -238,7 +247,7 @@ impl Kernels {
         };
         // SAFETY: the shapes were checked above, and the batch of one
         // input selects its only row either way.
-        unsafe { self.record_gemv(w, x, y, out, false, &self.single, commands) }
+        unsafe { self.record_gemv(w, x, y, out, false, false, &self.single, commands) }
     }
 
     /// Records `y = w x` for the rows of `x` that `batch` and `rows`
@@ -277,9 +286,25 @@ impl Kernels {
                 out.offset
             )));
         }
+        // A pass of many prompt tokens runs every row of the batch.
+        #[cfg(metal_driver)]
+        let many = rows == Rows::Tokens && commands.prompt();
+        #[cfg(not(metal_driver))]
+        let many = false;
         // SAFETY: checked above: `x` holds every row the batch can name and
         // `y` every output row it can ask for.
-        unsafe { self.record_gemv(w, x, y, out, rows == Rows::Head, batch.device(), commands) }
+        unsafe {
+            self.record_gemv(
+                w,
+                x,
+                y,
+                out,
+                rows == Rows::Head,
+                many,
+                batch.device(),
+                commands,
+            )
+        }
     }
 
     /// # Safety
@@ -294,11 +319,13 @@ impl Kernels {
         y: &DeviceBuffer<f32>,
         out: Out,
         head: bool,
+        many: bool,
         batch: &DeviceBuffer<u32>,
         commands: &mut Commands,
     ) -> Result<()> {
         let block = block_len(w.ty).ok_or(Error::Unsupported(w.ty))?;
-        let groups = w.rows.div_ceil(ROWS_PER_GROUP);
+        let (kernel, rows_per_group) = self.gemv_kernel(w.ty, many);
+        let groups = w.rows.div_ceil(rows_per_group);
         let wide = groups.min(MAX_GROUPS as usize);
         let tall = groups.div_ceil(wide.max(1));
         // SAFETY: matches gemv.wgsl: weights, x, qs, ds, y and the batch at
@@ -309,7 +336,7 @@ impl Kernels {
         // past the last row return early.
         unsafe {
             commands.dispatch(
-                self.gemv_kernel(w.ty),
+                kernel,
                 &[
                     w.data.allocation(),
                     x.x.allocation(),
@@ -331,8 +358,22 @@ impl Kernels {
         Ok(())
     }
 
-    fn gemv_kernel(&self, ty: TensorType) -> &Rc<Kernel> {
-        match ty {
+    /// The kernel for weights of type `ty` and the rows one of its
+    /// workgroups takes; with `many`, the one written for a pass of many
+    /// tokens, where the driver has it.
+    fn gemv_kernel(&self, ty: TensorType, many: bool) -> (&Rc<Kernel>, usize) {
+        #[cfg(metal_driver)]
+        if many {
+            match ty {
+                TensorType::Q4K => return (&self.gemv_q4_k_many, MANY_ROWS_PER_GROUP),
+                TensorType::Q5K => return (&self.gemv_q5_k_many, MANY_ROWS_PER_GROUP),
+                TensorType::Q6K => return (&self.gemv_q6_k_many, MANY_ROWS_PER_GROUP),
+                _ => {}
+            }
+        }
+        #[cfg(not(metal_driver))]
+        let _ = many;
+        let kernel = match ty {
             TensorType::F32 => &self.gemv_f32,
             TensorType::F16 => &self.gemv_f16,
             TensorType::Q8_0 => &self.gemv_q8_0,
@@ -340,6 +381,7 @@ impl Kernels {
             TensorType::Q5K => &self.gemv_q5_k,
             TensorType::Q6K => &self.gemv_q6_k,
             _ => unreachable!("block_len admits only types with kernels"),
-        }
+        };
+        (kernel, ROWS_PER_GROUP)
     }
 }

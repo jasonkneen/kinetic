@@ -77,6 +77,8 @@ pub fn all() -> Vec<(Store, PathBuf)> {
     let llama = var("LLAMA_CACHE").or_else(|| {
         if cfg!(windows) {
             var("LOCALAPPDATA").map(|d| d.join("llama.cpp"))
+        } else if cfg!(target_os = "macos") {
+            home().map(|h| h.join("Library").join("Caches").join("llama.cpp"))
         } else {
             xdg_cache().map(|c| c.join("llama.cpp"))
         }

@@ -65,7 +65,7 @@ impl<'a> VulkanBackend<'a> {
             }),
             warm: None,
             cpu: CpuBackend::new(model),
-            device: format!("{} (Vulkan)", gpu.device_name()),
+            device: format!("{} ({})", gpu.device_name(), kinetic_vulkan::API),
             model,
             gpu,
         })

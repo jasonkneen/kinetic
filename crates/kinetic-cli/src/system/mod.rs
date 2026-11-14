@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -9,6 +11,8 @@ mod gpu;
 
 #[cfg(target_os = "linux")]
 use linux as os;
+#[cfg(target_os = "macos")]
+use macos as os;
 #[cfg(windows)]
 use windows as os;
 
@@ -24,27 +28,36 @@ pub struct Machine {
     pub os: String,
     pub cpu: String,
     pub threads: usize,
-    /// The instruction sets Kinetic's CPU kernels need.
-    pub avx2: bool,
-    pub fma: bool,
-    pub f16c: bool,
+    /// The instruction sets Kinetic's CPU kernels use on this
+    /// architecture, each with whether this CPU has it.
+    pub isa: Vec<(&'static str, bool)>,
     pub ram_total: u64,
     pub ram_available: u64,
 }
 
 pub fn machine() -> Machine {
     let (ram_total, ram_available) = os::memory().unwrap_or((0, 0));
-    let (avx2, fma, f16c) = features();
     Machine {
         os: os::name(),
         cpu: cpu_name().unwrap_or_else(|| std::env::consts::ARCH.to_owned()),
-        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
-        avx2,
-        fma,
-        f16c,
+        threads: default_threads()
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
+        isa: features(),
         ram_total,
         ram_available,
     }
+}
+
+/// How many threads the CPU kernels should use when the user says nothing:
+/// the performance cores on macOS, where the efficiency cores would hold
+/// every parallel step back; `None` elsewhere, for every logical CPU.
+pub fn default_threads() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::performance_cores().filter(|&n| n > 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Bytes free for this user on the disk holding `path`.
@@ -57,18 +70,59 @@ pub fn disk_free(path: &Path) -> Option<u64> {
     os::disk_free(dir)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn features() -> (bool, bool, bool) {
-    (
-        is_x86_feature_detected!("avx2"),
-        is_x86_feature_detected!("fma"),
-        is_x86_feature_detected!("f16c"),
-    )
+impl Machine {
+    /// Whether the CPU has everything the fast kernels need.
+    pub fn fast_kernels(&self) -> bool {
+        self.isa.iter().all(|&(_, has)| has)
+    }
+
+    /// "AVX2 yes, FMA yes, F16C NO".
+    pub fn isa_summary(&self) -> String {
+        self.isa
+            .iter()
+            .map(|&(name, has)| format!("{name} {}", if has { "yes" } else { "NO" }))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The instruction sets the fast kernels need, for a message that
+    /// says what is missing.
+    pub fn isa_needed(&self) -> String {
+        let names: Vec<_> = self.isa.iter().map(|&(name, _)| name).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            Some((last, _)) => (*last).to_owned(),
+            None => String::new(),
+        }
+    }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn features() -> (bool, bool, bool) {
-    (false, false, false)
+#[cfg(target_arch = "x86_64")]
+fn features() -> Vec<(&'static str, bool)> {
+    vec![
+        ("AVX2", is_x86_feature_detected!("avx2")),
+        ("FMA", is_x86_feature_detected!("fma")),
+        ("F16C", is_x86_feature_detected!("f16c")),
+    ]
+}
+
+// NEON is part of every AArch64 CPU; the integer dot product (SDOT/UDOT)
+// and half-precision arithmetic are what the quantized kernels want.
+#[cfg(target_arch = "aarch64")]
+fn features() -> Vec<(&'static str, bool)> {
+    vec![
+        ("NEON", true),
+        (
+            "DotProd",
+            std::arch::is_aarch64_feature_detected!("dotprod"),
+        ),
+        ("FP16", std::arch::is_aarch64_feature_detected!("fp16")),
+    ]
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn features() -> Vec<(&'static str, bool)> {
+    Vec::new()
 }
 
 /// The brand string the CPU reports, from cpuid leaves 0x80000002..4.
@@ -96,7 +150,12 @@ fn cpu_name() -> Option<String> {
     (!name.is_empty()).then(|| name.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), target_os = "macos"))]
+fn cpu_name() -> Option<String> {
+    macos::sysctl_string(c"machdep.cpu.brand_string")
+}
+
+#[cfg(all(not(target_arch = "x86_64"), not(target_os = "macos")))]
 fn cpu_name() -> Option<String> {
     None
 }

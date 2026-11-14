@@ -3,7 +3,9 @@
 //! weight block to the same integer and fold it in with the same f32 steps,
 //! so they agree bit for bit.
 
-use super::{half, DotFn, DotNFn};
+#[cfg(target_arch = "x86_64")]
+use super::DotNFn;
+use super::{half, DotFn};
 use crate::q8k::Q8K;
 use kinetic_quant::{two_bit_code, TensorType};
 

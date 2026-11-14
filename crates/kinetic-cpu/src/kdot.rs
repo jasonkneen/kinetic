@@ -25,6 +25,10 @@ mod avx2_low_bit;
 mod avx2_tile;
 mod legacy;
 mod low_bit;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(target_arch = "aarch64")]
+mod neon_tile;
 mod pq2;
 #[cfg(target_arch = "x86_64")]
 mod unpack32;
@@ -51,6 +55,10 @@ pub fn kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
             .or_else(|| avx2_iq_s::kernel(ty))
             .or_else(|| pq2::avx2::kernel(ty));
     }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon::kernel(ty).or_else(|| scalar_kernel(ty));
+    }
     scalar_kernel(ty)
 }
 
@@ -63,6 +71,10 @@ pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8K, N>> {
             .or_else(|| avx2_iq_s::kernel_n::<N>(ty))
             .or_else(|| pq2::avx2::kernel_n::<N>(ty));
     }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon::kernel_n::<N>(ty);
+    }
     let _ = ty;
     None
 }
@@ -73,6 +85,10 @@ pub fn kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
     if avx2::available() {
         return avx2::kernel32(ty).or_else(|| avx2_legacy::kernel(ty));
     }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon::kernel32(ty).or_else(|| scalar_kernel32(ty));
+    }
     scalar_kernel32(ty)
 }
 
@@ -81,6 +97,10 @@ pub fn kernel32_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8, N>> {
     #[cfg(target_arch = "x86_64")]
     if avx2::available() {
         return avx2::kernel32_n::<N>(ty).or_else(|| avx2_legacy::kernel_n::<N>(ty));
+    }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon::kernel32_n::<N>(ty);
     }
     let _ = ty;
     None
@@ -175,6 +195,10 @@ pub fn tile_kernel(ty: TensorType) -> Option<TileKernel<Unpacked, Q8KGroup>> {
     if avx2::available() {
         return avx2_tile::kernel(ty);
     }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon_tile::kernel(ty);
+    }
     let _ = ty;
     None
 }
@@ -184,6 +208,10 @@ pub fn tile_kernel32(ty: TensorType) -> Option<TileKernel<Unpacked32, Q8Group>> 
     #[cfg(target_arch = "x86_64")]
     if avx2::available() {
         return avx2_tile::kernel32(ty);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if neon::available() {
+        return neon_tile::kernel32(ty);
     }
     let _ = ty;
     None

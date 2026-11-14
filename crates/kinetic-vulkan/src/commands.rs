@@ -25,6 +25,7 @@ pub struct Commands {
     /// Inside [`Commands::independent`]: whether a command of the group
     /// was recorded, after which the group's commands need no barrier.
     group: Option<bool>,
+    prompt: bool,
 }
 
 /// A timestamp recorded in a [`Commands`] list.
@@ -54,6 +55,7 @@ impl Commands {
             kernels: Vec::new(),
             buffers: Vec::new(),
             group: None,
+            prompt: false,
         };
         if device.info().features.timestamps {
             let info = vk::QueryPoolCreateInfo::default()
@@ -70,6 +72,20 @@ impl Commands {
             };
         }
         Ok(commands)
+    }
+
+    /// Says whether the commands recorded from here on run a pass of many
+    /// prompt tokens. A driver may then take kernels written for many
+    /// tokens at once, which give every token the bits it gets alone.
+    /// This driver has none.
+    pub fn set_prompt(&mut self, prompt: bool) {
+        self.prompt = prompt;
+    }
+
+    /// See [`Commands::set_prompt`].
+    #[allow(dead_code)]
+    pub(crate) fn prompt(&self) -> bool {
+        self.prompt
     }
 
     /// Records the device time once all earlier commands are done.
@@ -134,6 +150,8 @@ impl Commands {
         Ok(Graph {
             device: Rc::clone(&self.device),
             cmd,
+            // The recording resets the pool, so it must outlive every run.
+            queries: std::mem::replace(&mut self.queries, vk::QueryPool::null()),
             _kernels: std::mem::take(&mut self.kernels),
             _buffers: std::mem::take(&mut self.buffers),
         })
@@ -255,6 +273,7 @@ impl Commands {
 pub struct Graph {
     device: Rc<Device>,
     cmd: vk::CommandBuffer,
+    queries: vk::QueryPool,
     _kernels: Vec<Rc<Kernel>>,
     _buffers: Vec<Rc<Allocation>>,
 }
@@ -270,6 +289,9 @@ impl Graph {
 impl Drop for Graph {
     fn drop(&mut self) {
         self.device.free(self.cmd);
+        // SAFETY: every run was waited for, and the buffer that used the
+        // pool is freed; destroying a null pool is a no-op.
+        unsafe { self.device.raw.destroy_query_pool(self.queries, None) };
     }
 }
 

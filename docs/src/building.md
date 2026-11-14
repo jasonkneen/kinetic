@@ -98,8 +98,8 @@ cargo clippy --release --workspace --all-targets --all-features -- -D warnings
 cargo test --release --workspace
 ```
 
-CI runs the same on Windows and Linux, builds the C example with `gcc` and
-`cl`, and builds and tests the Python package.
+CI runs the same on Windows, Linux and macOS, builds the C example with
+`gcc`, `clang` and `cl`, and builds and tests the Python package.
 
 ## The documentation
 

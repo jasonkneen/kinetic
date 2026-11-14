@@ -137,6 +137,11 @@ pub(crate) fn api() -> Result<&'static Api> {
 }
 
 fn load() -> Result<Api> {
+    if cfg!(target_os = "macos") {
+        return Err(Error::DriverNotFound(
+            "CUDA is not available on macOS".into(),
+        ));
+    }
     // SAFETY: loading the driver runs only its own initialization code.
     let library =
         unsafe { Library::new(LIBRARY) }.map_err(|e| Error::DriverNotFound(e.to_string()))?;

@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, windows-2022, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +33,13 @@ jobs:
         run: cargo clippy --release --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --release --locked --workspace
-      - name: C example (gcc)
-        if: runner.os == 'Linux'
+      - name: C example (gcc, clang)
+        if: runner.os != 'Windows'
         run: |
           cargo build --release --locked -p kinetic-capi
-          gcc -std=c99 -Wall -Wextra -Werror -I crates/kinetic-capi/include \
+          cc -std=c99 -Wall -Wextra -Werror -I crates/kinetic-capi/include \
             crates/kinetic-capi/examples/chat.c -L target/release -lkinetic_capi -o chat
-          LD_LIBRARY_PATH=target/release ./chat 2>&1 | grep -q usage
+          LD_LIBRARY_PATH=target/release DYLD_LIBRARY_PATH=target/release ./chat 2>&1 | grep -q usage
       - name: C example (cl)
         if: runner.os == 'Windows'
         shell: cmd
@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, windows-2022, macos-15]
     runs-on: ${{ matrix.os }}
     defaults:
       run:

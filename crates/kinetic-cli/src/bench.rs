@@ -126,7 +126,7 @@ pub fn run(
                 Ok(if rad1 { gpu } else { gpu.without_drafts() })
             };
             let speeds = measure(*plain, drafting, &model, &edit, tests)?;
-            ("Vulkan", on, speeds)
+            (crate::gpu::VULKAN, on, speeds)
         }
         #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
         Some(Plain::Unavailable(never, _)) => match never {},

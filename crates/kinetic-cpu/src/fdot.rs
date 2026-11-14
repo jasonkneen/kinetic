@@ -19,6 +19,10 @@ pub fn supported(ty: TensorType) -> bool {
     if matches!(ty, TensorType::F16 | TensorType::BF16) {
         return avx2::available();
     }
+    #[cfg(target_arch = "aarch64")]
+    if matches!(ty, TensorType::F16 | TensorType::BF16) {
+        return true;
+    }
     let _ = ty;
     false
 }
@@ -36,7 +40,13 @@ pub fn dots(ty: TensorType, rows: &[&[u8]], xs: &[&[f32]]) -> [[f32; TOKENS]; RO
         // lengths were just checked.
         unsafe { avx2::dots(ty == TensorType::BF16, rows, xs) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of every AArch64 CPU, and the lengths were
+        // just checked.
+        unsafe { neon::dots(ty == TensorType::BF16, rows, xs) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unreachable!()
 }
 
@@ -144,6 +154,143 @@ mod avx2 {
                 let xv = _mm256_loadu_ps(x[t].add(c));
                 for r in 0..R {
                     acc[r][t] = _mm256_fmadd_ps(wv[r], xv, acc[r][t]);
+                }
+            }
+        }
+        let mut out = [[0.0; T]; R];
+        for r in 0..R {
+            for t in 0..T {
+                let mut tail = 0.0;
+                for c in body..cols {
+                    tail += widen1::<BF16>(&rows[r][2 * c..]) * xs[t][c];
+                }
+                out[r][t] = hsum(acc[r][t]) + tail;
+            }
+        }
+        out
+    }
+}
+
+/// The AVX2 kernel lane for lane: eight lanes per product as two vectors,
+/// fused multiply-adds down the columns, and the lanes added in the same
+/// order, so a product is the same on both architectures.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    use half::{bf16, f16};
+
+    use super::{ROWS, TOKENS};
+
+    /// [`super::dots`] for checked lengths.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dots(bf16: bool, rows: &[&[u8]], xs: &[&[f32]]) -> [[f32; TOKENS]; ROWS] {
+        if bf16 {
+            by_rows::<true>(rows, xs)
+        } else {
+            by_rows::<false>(rows, xs)
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn by_rows<const BF16: bool>(rows: &[&[u8]], xs: &[&[f32]]) -> [[f32; TOKENS]; ROWS] {
+        match *rows {
+            [a, b, c, d] => by_tokens::<BF16, 4>([a, b, c, d], xs),
+            [a] => by_tokens::<BF16, 1>([a], xs),
+            _ => panic!("{} rows", rows.len()),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn by_tokens<const BF16: bool, const R: usize>(
+        rows: [&[u8]; R],
+        xs: &[&[f32]],
+    ) -> [[f32; TOKENS]; ROWS] {
+        let mut out = [[0.0; TOKENS]; ROWS];
+        let mut copy = |v: &[[f32; TOKENS]]| out[..R].copy_from_slice(v);
+        match *xs {
+            [a, b, c] => copy(&tile::<BF16, R, 3>(rows, [a, b, c])),
+            [a, b] => copy(&pad(tile::<BF16, R, 2>(rows, [a, b]))),
+            [a] => copy(&pad(tile::<BF16, R, 1>(rows, [a]))),
+            _ => panic!("{} tokens", xs.len()),
+        }
+        out
+    }
+
+    fn pad<const R: usize, const T: usize>(v: [[f32; T]; R]) -> [[f32; TOKENS]; R] {
+        v.map(|v| std::array::from_fn(|t| v.get(t).copied().unwrap_or(0.0)))
+    }
+
+    /// Eight weights from `p` as f32, in two vectors.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn widen<const BF16: bool>(p: *const u8) -> [float32x4_t; 2] {
+        let v = vld1q_u16(p as *const u16);
+        if BF16 {
+            [
+                vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(v))),
+                vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(v))),
+            ]
+        } else {
+            [widen_f16(vget_low_u16(v)), widen_f16(vget_high_u16(v))]
+        }
+    }
+
+    /// Four f16 as f32: FCVTL, whose intrinsic is newer than the MSRV.
+    #[inline(always)]
+    unsafe fn widen_f16(h: uint16x4_t) -> float32x4_t {
+        let out: float32x4_t;
+        std::arch::asm!(
+            "fcvtl {0:v}.4s, {1:v}.4h",
+            out(vreg) out,
+            in(vreg) h,
+            options(pure, nomem, nostack)
+        );
+        out
+    }
+
+    fn widen1<const BF16: bool>(p: &[u8]) -> f32 {
+        let bits = u16::from_le_bytes([p[0], p[1]]);
+        if BF16 {
+            bf16::from_bits(bits).to_f32()
+        } else {
+            f16::from_bits(bits).to_f32()
+        }
+    }
+
+    /// The eight lanes added as the AVX2 `hsum` adds them.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn hsum(v: [float32x4_t; 2]) -> f32 {
+        let s = vaddq_f32(v[0], v[1]);
+        (vgetq_lane_f32::<0>(s) + vgetq_lane_f32::<2>(s))
+            + (vgetq_lane_f32::<1>(s) + vgetq_lane_f32::<3>(s))
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn tile<const BF16: bool, const R: usize, const T: usize>(
+        rows: [&[u8]; R],
+        xs: [&[f32]; T],
+    ) -> [[f32; T]; R] {
+        let cols = xs[0].len();
+        let body = cols / 8 * 8;
+        // Raw pointers keep bounds checks, and the registers they need, out
+        // of the loop; `super::dots` checked every length.
+        let (w, x) = (rows.map(<[u8]>::as_ptr), xs.map(<[f32]>::as_ptr));
+        let zero = [vdupq_n_f32(0.0); 2];
+        let mut acc = [[zero; T]; R];
+        for c in (0..body).step_by(8) {
+            let mut wv = [zero; R];
+            for (wv, w) in wv.iter_mut().zip(w) {
+                *wv = widen::<BF16>(w.add(2 * c));
+            }
+            for t in 0..T {
+                let xv = [vld1q_f32(x[t].add(c)), vld1q_f32(x[t].add(c + 4))];
+                for r in 0..R {
+                    acc[r][t][0] = vfmaq_f32(acc[r][t][0], wv[r][0], xv[0]);
+                    acc[r][t][1] = vfmaq_f32(acc[r][t][1], wv[r][1], xv[1]);
                 }
             }
         }

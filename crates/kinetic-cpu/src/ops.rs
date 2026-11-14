@@ -1,8 +1,8 @@
 //! Element-wise and reduction kernels on f32 vectors.
 //!
-//! [`dot`], [`dots`] and [`axpy`] have AVX2 versions picked at run time that
-//! perform the operations of the portable versions lane for lane, without
-//! fusing, and so give identical values.
+//! [`dot`], [`dots`] and [`axpy`] have AVX2 and NEON versions picked at run
+//! time that perform the operations of the portable versions lane for lane,
+//! without fusing, and so give identical values.
 
 /// The inner product of two vectors of the same length.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -20,6 +20,10 @@ pub fn dots<const N: usize>(a: [&[f32]; N], b: &[f32]) -> [f32; N] {
         // SAFETY: AVX2 was just detected and the lengths checked.
         return unsafe { avx2::dots(a, b) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU and the lengths checked.
+    return unsafe { neon::dots(a, b) };
+    #[cfg(not(target_arch = "aarch64"))]
     dots_portable(a, b)
 }
 
@@ -31,6 +35,10 @@ pub fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
         // SAFETY: AVX2 was just detected and the lengths checked.
         return unsafe { avx2::axpy(y, a, x) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU and the lengths checked.
+    return unsafe { neon::axpy(y, a, x) };
+    #[cfg(not(target_arch = "aarch64"))]
     y.iter_mut().zip(x).for_each(|(y, x)| *y += a * x);
 }
 
@@ -42,6 +50,10 @@ pub fn scale_axpy(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
         // SAFETY: AVX2 was just detected and the lengths checked.
         return unsafe { avx2::scale_axpy(y, a, b, x) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU and the lengths checked.
+    return unsafe { neon::scale_axpy(y, a, b, x) };
+    #[cfg(not(target_arch = "aarch64"))]
     y.iter_mut().zip(x).for_each(|(y, x)| *y = *y * a + b * x);
 }
 
@@ -59,7 +71,12 @@ pub fn dot_rows<const N: usize>(a: [&[f32]; N], rows: &[f32], stride: usize, out
         // SAFETY: AVX2 was just detected and the lengths checked.
         return unsafe { avx2::dot_rows(a, rows, stride, out) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU and the lengths checked.
+    return unsafe { neon::dot_rows(a, rows, stride, out) };
+    #[cfg(not(target_arch = "aarch64"))]
     let mut out = out;
+    #[cfg(not(target_arch = "aarch64"))]
     for s in 0..count {
         let d = dots_portable(a, &rows[s * stride..][..len]);
         for (out, d) in out.iter_mut().zip(d) {
@@ -81,6 +98,10 @@ pub fn axpy_rows(y: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
         // SAFETY: AVX2 was just detected and the lengths checked.
         return unsafe { avx2::axpy_rows(y, w, rows, stride) };
     }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of every AArch64 CPU and the lengths checked.
+    return unsafe { neon::axpy_rows(y, w, rows, stride) };
+    #[cfg(not(target_arch = "aarch64"))]
     for (s, &w) in w.iter().enumerate() {
         let row = &rows[s * stride..][..y.len()];
         y.iter_mut().zip(row).for_each(|(y, x)| *y += w * x);
@@ -90,6 +111,7 @@ pub fn axpy_rows(y: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
 /// Eight running sums per product, one per lane of a vector register, added
 /// in lane order at the end, then the products past the last multiple of
 /// eight in order.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn dots_portable<const N: usize>(a: [&[f32]; N], b: &[f32]) -> [f32; N] {
     let body = b.len() / 8 * 8;
     let mut acc = [[0.0f32; 8]; N];
@@ -218,6 +240,146 @@ mod avx2 {
             let p = y[c..c + 8].as_mut_ptr();
             let v = _mm256_mul_ps(bv, _mm256_loadu_ps(x[c..c + 8].as_ptr()));
             _mm256_storeu_ps(p, _mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(p), av), v));
+        }
+        for (y, x) in y[body..].iter_mut().zip(&x[body..]) {
+            *y = *y * a + b * x;
+        }
+    }
+}
+
+/// The AVX2 module lane for lane, each eight-lane vector as two of four.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    type V8 = [float32x4_t; 2];
+
+    #[inline(always)]
+    unsafe fn load(p: *const f32) -> V8 {
+        [vld1q_f32(p), vld1q_f32(p.add(4))]
+    }
+
+    #[inline(always)]
+    unsafe fn store(p: *mut f32, v: V8) {
+        vst1q_f32(p, v[0]);
+        vst1q_f32(p.add(4), v[1]);
+    }
+
+    /// `acc + x * y`, the product rounded on its own as the portable
+    /// version rounds it.
+    #[inline(always)]
+    unsafe fn mul_add(acc: V8, x: V8, y: V8) -> V8 {
+        [
+            vaddq_f32(acc[0], vmulq_f32(x[0], y[0])),
+            vaddq_f32(acc[1], vmulq_f32(x[1], y[1])),
+        ]
+    }
+
+    /// [`super::dots_portable`] for slices of `b`'s length.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dots<const N: usize>(a: [&[f32]; N], b: &[f32]) -> [f32; N] {
+        let body = b.len() / 8 * 8;
+        let zero = [vdupq_n_f32(0.0); 2];
+        let mut acc = [zero; N];
+        for c in (0..body).step_by(8) {
+            let y = load(b[c..c + 8].as_ptr());
+            for (acc, a) in acc.iter_mut().zip(a) {
+                *acc = mul_add(*acc, load(a[c..c + 8].as_ptr()), y);
+            }
+        }
+        let mut out = [0.0; N];
+        for (n, out) in out.iter_mut().enumerate() {
+            let mut lanes = [0.0; 8];
+            store(lanes.as_mut_ptr(), acc[n]);
+            *out = super::finish(lanes, &a[n][body..], &b[body..]);
+        }
+        out
+    }
+
+    /// [`super::dot_rows`] for checked lengths.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_rows<const N: usize>(
+        a: [&[f32]; N],
+        rows: &[f32],
+        stride: usize,
+        mut out: [&mut [f32]; N],
+    ) {
+        let len = a[0].len();
+        for s in 0..out[0].len() {
+            let d = dots(a, &rows[s * stride..][..len]);
+            for (out, d) in out.iter_mut().zip(d) {
+                out[s] = d;
+            }
+        }
+    }
+
+    /// [`super::axpy_rows`] for checked lengths. Columns are taken 64 at
+    /// a time so that their sums stay in registers across all rows.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn axpy_rows(y: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
+        let body = y.len() / 8 * 8;
+        let mut c = 0;
+        while c + 64 <= body {
+            columns::<8>(&mut y[c..], w, &rows[c..], stride);
+            c += 64;
+        }
+        while c < body {
+            columns::<1>(&mut y[c..], w, &rows[c..], stride);
+            c += 8;
+        }
+        for (s, &w) in w.iter().enumerate() {
+            let row = &rows[s * stride..][..y.len()];
+            for (y, x) in y[body..].iter_mut().zip(&row[body..]) {
+                *y += w * x;
+            }
+        }
+    }
+
+    /// The first `8 * K` columns of [`axpy_rows`].
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn columns<const K: usize>(y: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
+        let mut acc = [[vdupq_n_f32(0.0); 2]; K];
+        for (k, acc) in acc.iter_mut().enumerate() {
+            *acc = load(y[8 * k..][..8].as_ptr());
+        }
+        for (s, &w) in w.iter().enumerate() {
+            let row = &rows[s * stride..][..8 * K];
+            let w = [vdupq_n_f32(w); 2];
+            for (k, acc) in acc.iter_mut().enumerate() {
+                *acc = mul_add(*acc, w, load(row[8 * k..][..8].as_ptr()));
+            }
+        }
+        for (k, acc) in acc.iter().enumerate() {
+            store(y[8 * k..][..8].as_mut_ptr(), *acc);
+        }
+    }
+
+    /// `y += a * x` for slices of the same length.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
+        let body = y.len() / 8 * 8;
+        let av = [vdupq_n_f32(a); 2];
+        for c in (0..body).step_by(8) {
+            let p = y[c..c + 8].as_mut_ptr();
+            store(p, mul_add(load(p), av, load(x[c..c + 8].as_ptr())));
+        }
+        for (y, x) in y[body..].iter_mut().zip(&x[body..]) {
+            *y += a * x;
+        }
+    }
+
+    /// `y = y * a + b * x` for slices of the same length.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn scale_axpy(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
+        let body = y.len() / 8 * 8;
+        let (av, bv) = ([vdupq_n_f32(a); 2], [vdupq_n_f32(b); 2]);
+        for c in (0..body).step_by(8) {
+            let p = y[c..c + 8].as_mut_ptr();
+            let (yv, xv) = (load(p), load(x[c..c + 8].as_ptr()));
+            let ya = [vmulq_f32(yv[0], av[0]), vmulq_f32(yv[1], av[1])];
+            store(p, mul_add(ya, bv, xv));
         }
         for (y, x) in y[body..].iter_mut().zip(&x[body..]) {
             *y = *y * a + b * x;

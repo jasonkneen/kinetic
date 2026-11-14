@@ -46,9 +46,29 @@ pub use mtp::VulkanMtpState;
 use rope::RopeTables;
 use work::Work;
 
-/// Most tokens one pass runs, and most that may run between a checkpoint
-/// and its rollback.
+/// Most tokens one pass runs, prompt passes apart, and most that may run
+/// between a checkpoint and its rollback.
 pub const MAX_BATCH: usize = 16;
+
+/// Fewest tokens worth a prompt pass: below, the kernels a token is
+/// decoded with are the faster ones.
+const PROMPT_MIN: usize = 4;
+
+/// Most tokens a prompt pass runs: what the driver asks for, or
+/// [`MAX_BATCH`] if it has no kernels of its own for such passes. They
+/// give every token the bits it gets alone, so nothing but speed depends
+/// on how a prompt is split.
+const PROMPT_BATCH: usize = larger(kinetic_vulkan::PROMPT_BATCH, MAX_BATCH);
+
+// Not `max`: clippy refuses to compare the 0 of a driver without a prompt
+// kernel as a constant.
+const fn larger(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 /// The device and its kernels.
 struct Gpu {
@@ -105,11 +125,19 @@ pub struct VulkanState {
     pos: usize,
     checkpoint: Option<usize>,
     work: Work,
+    /// The buffers of a prompt pass, if it runs more tokens than any
+    /// other: a pass costs a little by the rows its buffers hold, which
+    /// would slow every token decoded.
+    prompt_work: Option<Work>,
     layers: Vec<LayerState>,
     /// The recorded pass, and the same with the logits of one head row
     /// brought back.
     step: Graph,
     step_logits: Graph,
+    /// The same two for a pass of many prompt tokens, which the device may
+    /// run with kernels written for many tokens at once.
+    step_prompt: Graph,
+    step_prompt_logits: Graph,
     /// Brings back the logits of every head row.
     all_logits: Graph,
     /// What a rollback runs, when a layer needs it.
@@ -178,7 +206,7 @@ impl<'m> VulkanModel<'m> {
             kernels: Kernels::load(&device).map_err(vulkan_error)?,
             device,
         };
-        let mut ropes = RopeTables::new(MAX_BATCH);
+        let mut ropes = RopeTables::new(PROMPT_BATCH);
         let layers = model
             .layers
             .iter()
@@ -229,12 +257,21 @@ impl<'m> VulkanModel<'m> {
     /// An empty state for a new sequence.
     pub fn new_state(&self) -> kinetic_vulkan::Result<VulkanState> {
         let dev = &self.gpu.device;
-        let batch = Batch::new(dev, MAX_BATCH, MAX_BATCH, self.context, self.ropes.words())?;
-        let work = Work::new(&self.gpu, &self.layers, self.n_embd, batch, self.n_vocab())?;
+        let work = |rows, head_rows| {
+            let batch = Batch::new(dev, rows, head_rows, self.context, self.ropes.words())?;
+            Work::new(&self.gpu, &self.layers, self.n_embd, batch, self.n_vocab())
+        };
+        // A prompt pass wants the logits of its last token at most.
+        let many = PROMPT_BATCH > MAX_BATCH;
+        let prompt_work = match many {
+            true => Some(work(PROMPT_BATCH, 1)?),
+            false => None,
+        };
+        let work = work(MAX_BATCH, MAX_BATCH)?;
         let layers = self
             .layers
             .iter()
-            .map(|l| l.new_state(dev, self.context, MAX_BATCH))
+            .map(|l| l.new_state(dev, self.context, PROMPT_BATCH))
             .collect::<kinetic_vulkan::Result<Vec<_>>>()?;
         let vocab = self.n_vocab();
         let mut all_logits = Commands::new(dev)?;
@@ -246,11 +283,24 @@ impl<'m> VulkanModel<'m> {
         Ok(VulkanState {
             pos: 0,
             checkpoint: None,
-            step: self.record(&work, &layers, false)?,
-            step_logits: self.record(&work, &layers, true)?,
+            step: self.record(&work, &layers, false, false)?,
+            step_logits: self.record(&work, &layers, true, false)?,
+            step_prompt: self.record(
+                prompt_work.as_ref().unwrap_or(&work),
+                &layers,
+                false,
+                many,
+            )?,
+            step_prompt_logits: self.record(
+                prompt_work.as_ref().unwrap_or(&work),
+                &layers,
+                true,
+                many,
+            )?,
             all_logits: all_logits.finish()?,
             replay,
             work,
+            prompt_work,
             layers,
             marks: Vec::new(),
         })
@@ -270,7 +320,8 @@ impl<'m> VulkanModel<'m> {
     /// Device bytes held by `state`.
     pub fn state_bytes(&self, state: &VulkanState) -> usize {
         let layers: usize = state.layers.iter().map(LayerState::size_bytes).sum();
-        state.work.size_bytes() + layers
+        let prompt = state.prompt_work.as_ref().map_or(0, Work::size_bytes);
+        state.work.size_bytes() + prompt + layers
     }
 
     /// Records one pass: the batch and embeddings in, every layer, the
@@ -281,9 +332,11 @@ impl<'m> VulkanModel<'m> {
         w: &Work,
         states: &[LayerState],
         logits: bool,
+        prompt: bool,
     ) -> kinetic_vulkan::Result<Graph> {
         let (k, d) = (&self.gpu.kernels, self.n_embd);
         let mut c = Commands::new(&self.gpu.device)?;
+        c.set_prompt(prompt);
         let rows = w.batch.rows();
         c.independent(|c| {
             w.batch.record_upload(c)?;
@@ -450,22 +503,40 @@ impl<'m> VulkanModel<'m> {
             logits: Vec::new(),
         };
         let mut done = 0;
-        for chunk in tokens.chunks(MAX_BATCH) {
-            let n = chunk.len();
+        let mut rest = tokens;
+        while !rest.is_empty() {
+            // Tokens whose rows are not each wanted, and that no draft may
+            // be rolled back over, are prompt processing, which takes them
+            // in passes as large as it can.
+            let prompt = PROMPT_BATCH > MAX_BATCH
+                && !all_rows
+                && state.checkpoint.is_none()
+                && rest.len() >= PROMPT_MIN;
+            let n = rest.len().min(match prompt {
+                true => PROMPT_BATCH,
+                false => MAX_BATCH,
+            });
+            let chunk;
+            (chunk, rest) = rest.split_at(n);
             let head: Range<usize> = match (all_rows, done + n == tokens.len()) {
                 (true, _) => 0..n,
                 (false, true) => n - 1..n,
                 (false, false) => n..n,
             };
-            let w = &mut state.work;
+            let w = match (prompt, &mut state.prompt_work) {
+                (true, Some(w)) => w,
+                _ => &mut state.work,
+            };
             w.batch.set(n, state.pos, head.clone(), state.checkpoint)?;
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
             let one = logits && head.len() == 1;
-            match one {
-                true => state.step_logits.launch()?,
-                false => state.step.launch()?,
+            match (one, prompt) {
+                (true, true) => state.step_prompt_logits.launch()?,
+                (true, false) => state.step_logits.launch()?,
+                (false, true) => state.step_prompt.launch()?,
+                (false, false) => state.step.launch()?,
             }
             for pair in w.greedy.as_slice()[..2 * head.len()].chunks_exact(2) {
                 out.greedy.push(pair[0]);

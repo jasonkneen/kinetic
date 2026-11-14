@@ -20,17 +20,14 @@ pub fn run() -> Result<()> {
 
     let mut out = std::io::stdout().lock();
     let gib = |b: u64| b as f64 / GIB;
-    let yes = |b: bool| if b { "yes" } else { "NO" };
     writeln!(out, "Kinetic {}", env!("CARGO_PKG_VERSION"))?;
     writeln!(out, "  system   {}", m.os)?;
     writeln!(
         out,
-        "  cpu      {}, {} threads, AVX2 {}, FMA {}, F16C {}",
+        "  cpu      {}, {} threads, {}",
         m.cpu,
         m.threads,
-        yes(m.avx2),
-        yes(m.fma),
-        yes(m.f16c)
+        m.isa_summary()
     )?;
     writeln!(
         out,
@@ -68,8 +65,11 @@ pub fn run() -> Result<()> {
     }
 
     let mut fixes = Vec::new();
-    if !(m.avx2 && m.fma && m.f16c) {
-        fixes.push("this CPU lacks AVX2, FMA or F16C, which Kinetic's CPU kernels use; expect slow CPU runs".to_owned());
+    if !m.fast_kernels() {
+        fixes.push(format!(
+            "this CPU lacks {}, which Kinetic's CPU kernels use; expect slow CPU runs",
+            m.isa_needed()
+        ));
     }
     let cuda = gpus.iter().any(|g| g.api == "CUDA");
     let nvidia_seen = gpus.iter().any(|g| g.name.contains(NVIDIA));
